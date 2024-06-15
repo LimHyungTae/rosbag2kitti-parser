@@ -121,10 +121,13 @@ class ViVidPlusPlusSubAndSyncSaver(BaseSubAndSyncSaver):
         self.pose_txt_path = config.pose_txt_path
         self.time_txt_path = config.time_txt_path
 
+        self.time_offset = 0.0
         if "campus_day2" in self.pose_txt_path:
             self.poses = self.load_campus_pose(self.pose_txt_path)
+            self.time_offset = 0.0
         elif "city_day2" in self.pose_txt_path:
             self.poses = self.load_city_pose(self.pose_txt_path)
+            self.time_offset = 1621837331.57603
         else:
             raise ValueError("Un-tested sequence is given.")
         # unit: sec
@@ -234,68 +237,72 @@ class ViVidPlusPlusSubAndSyncSaver(BaseSubAndSyncSaver):
         secs = msg.header.stamp.secs
         nsecs = f"{msg.header.stamp.nsecs:09d}"
         timestamp = float(secs) + float(nsecs) * 1e-9
-        print(timestamp, rospy.Time.now())
-        print(timestamp, rospy.Time.now())
-        print(timestamp, rospy.Time.now())
+        print(f"Timestamp in point cloud topic: {timestamp}")
+        timestamp += self.time_offset
+        print(f"After: {timestamp}")
+        if (timestamp < self.key_times[0]):
+            print(f"Timestamp is too early! Waiting for next scans...")
+            return
+        if (timestamp > self.key_times[-1]):
+            print(f"Timestamp is out of our boundary! End to save data...")
+            return
 
+        # Convert PointCloud2 message to PCL PointCloud
+        cloud_points = list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))
+        cloud_np = np.array(cloud_points).reshape(-1, 3)
 
-        # # Convert PointCloud2 message to PCL PointCloud
-        # cloud_points = list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))
-        # cloud_np = np.array(cloud_points).reshape(-1, 3)
-        #
-        # nsecs_for_each_pt = np.array(list(pc2.read_points(msg, field_names=("t"), skip_nans=True)))
-        # nsecs_for_each_pt = np.reshape(nsecs_for_each_pt, (-1))
-        #
-        # # Previous version of interpolation with deskewing
-        # # pose_for_scan_time = self.interpolate_pose(timestamp)
-        # # deskewed_points = []
-        # # for idx in range(cloud_np.shape[0]):
-        # #     pt = cloud_np[idx, :]
-        # #     pt_time_offset = (nsecs_for_each_pt[idx]) * 1e-9
-        # #     pt_timestamp = timestamp + pt_time_offset
-        # #     corresponding_pose = self.interpolate_pose(pt_timestamp)
-        # #     transformed_point = corresponding_pose @ np.array([pt[0], pt[1], pt[2], 1.0])
-        # #     deskewed_points.append(transformed_point[:3])
-        # # transformed = np.array(deskewed_points, dtype=np.float32)
-        #
-        # # I omit deskewing for translation
+        nsecs_for_each_pt = np.array(list(pc2.read_points(msg, field_names=("t"), skip_nans=True)))
+        nsecs_for_each_pt = np.reshape(nsecs_for_each_pt, (-1))
+
+        # Previous version of interpolation with deskewing
         # pose_for_scan_time = self.interpolate_pose(timestamp)
-        # deskewed_points = self.deskew_scan(timestamp, cloud_np, nsecs_for_each_pt)
-        # transformed = pose_for_scan_time @ np.hstack((deskewed_points, np.ones((deskewed_points.shape[0], 1)))).T
-        # transformed = transformed.T[:, :3].astype(np.float32)
-        #
-        # # print(len(cloud_points), len(cloud_points[0]))
-        # pcl_cloud = pcl.PointCloud()
-        # pcl_cloud.from_array(transformed)
-        #
-        # if self.save_on:
-        #     with open(self.output_pose_path, 'a') as f:
-        #         pose_flattened = pose_for_scan_time[:3, :].flatten()
-        #         pose_str = ' '.join(map(str, pose_flattened))
-        #         f.write(pose_str + '\n')
-        #     # Save to PCD file
-        #     # Follow the MulRan dataset format
-        #     filename = f"{self.output_pcd_dir}/{secs}_{nsecs}.pcd"
-        #     pcl.save(pcl_cloud, filename)
-        #     rospy.loginfo(f"Saved point cloud to {filename}")
-        #
-        # # Convert transformed numpy array back to PointCloud2 message
-        # header = msg.header
-        # header.frame_id = "map"
-        # fields = [
-        #     PointField('x', 0, PointField.FLOAT32, 1),
-        #     PointField('y', 4, PointField.FLOAT32, 1),
-        #     PointField('z', 8, PointField.FLOAT32, 1),
-        # ]
-        # msg_transformed = pc2.create_cloud(header, fields, transformed)
-        #
-        # end_time = time.time()
-        # elapsed_time = end_time - start_time
-        #
-        # # Publish the modified message
-        # self.pub.publish(msg)
-        # self.pub_transformed.publish(msg_transformed)
-        # print("Published the " + str(timestamp) + " message! (", elapsed_time, "sec taken)")
+        # deskewed_points = []
+        # for idx in range(cloud_np.shape[0]):
+        #     pt = cloud_np[idx, :]
+        #     pt_time_offset = (nsecs_for_each_pt[idx]) * 1e-9
+        #     pt_timestamp = timestamp + pt_time_offset
+        #     corresponding_pose = self.interpolate_pose(pt_timestamp)
+        #     transformed_point = corresponding_pose @ np.array([pt[0], pt[1], pt[2], 1.0])
+        #     deskewed_points.append(transformed_point[:3])
+        # transformed = np.array(deskewed_points, dtype=np.float32)
+
+        # I omit deskewing for translation
+        pose_for_scan_time = self.interpolate_pose(timestamp)
+        deskewed_points = self.deskew_scan(timestamp, cloud_np, nsecs_for_each_pt)
+        transformed = pose_for_scan_time @ np.hstack((deskewed_points, np.ones((deskewed_points.shape[0], 1)))).T
+        transformed = transformed.T[:, :3].astype(np.float32)
+
+        # print(len(cloud_points), len(cloud_points[0]))
+        pcl_cloud = pcl.PointCloud()
+        pcl_cloud.from_array(transformed)
+
+        if self.save_on:
+            with open(self.output_pose_path, 'a') as f:
+                pose_flattened = pose_for_scan_time[:3, :].flatten()
+                pose_str = ' '.join(map(str, pose_flattened))
+                f.write(pose_str + '\n')
+            # Save to PCD file
+            # Follow the MulRan dataset format
+            filename = f"{self.output_pcd_dir}/{secs}_{nsecs}.pcd"
+            pcl.save(pcl_cloud, filename)
+            rospy.loginfo(f"Saved point cloud to {filename}")
+
+        # Convert transformed numpy array back to PointCloud2 message
+        header = msg.header
+        header.frame_id = "map"
+        fields = [
+            PointField('x', 0, PointField.FLOAT32, 1),
+            PointField('y', 4, PointField.FLOAT32, 1),
+            PointField('z', 8, PointField.FLOAT32, 1),
+        ]
+        msg_transformed = pc2.create_cloud(header, fields, transformed)
+
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+
+        # Publish the modified message
+        self.pub.publish(msg)
+        self.pub_transformed.publish(msg_transformed)
 
 def get_bag_time(bag_file):
     # Open the bag file
@@ -308,7 +315,8 @@ def get_bag_time(bag_file):
             # Get the current time
             current_time = t.to_sec()
             if topic == "/os1_cloud_node/points":
-                print(f"Current time in bag: {current_time} seconds, {topic}")
+                # print(f"Current time in bag: {current_time} seconds, {topic}")
+                print(current_time)
                 count += 1
             if count > 5:
                 break
