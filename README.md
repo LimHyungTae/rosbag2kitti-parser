@@ -20,12 +20,14 @@ python3 sync_and_save.py --csv_path '/media/shapelim/UX960NVMe1/newer-college-da
 ## ViViD++ Dataset
 
 The timestamps of the ground truths are in consistent.
-* campus_day2: GT uses local timestamp, which matchs to the point cloud msg time, i.e. there's no time offset. 
-* city_day2: GT uses rosbag timestamp, but the message is not in the rosbag. So, we need to use the time offset (see `vivid_plusplus_city_day2_time_anaylses.ods`).
+* `campus_day2`: GT uses local timestamp, which matchs to the point cloud msg time, i.e. there's no time offset. 
+* `city_day2`: GT uses rosbag timestamp, but the message is not in the rosbag. So, we need to use the time offset
+  * See `vivid_plusplus_city_day2_time_anaylses.ods`. I sampled the five recent timestamps, and do average to get the time offset.
 
 ## Newer College Dataset
 
 TBU
+
 ## Kimera-Multi Dataset
 
 TBU
