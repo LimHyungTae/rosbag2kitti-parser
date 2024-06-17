@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 import rosbag
 import rospy
-from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs.msg import PointCloud2, PointField, CompressedImage
+from nav_msgs.msg import Odometry
 import sensor_msgs.point_cloud2 as pc2
 import pcl
 import argparse
@@ -11,6 +12,10 @@ import time
 import os
 import re
 from utils import *
+from tqdm import tqdm
+import tf
+from cv_bridge import CvBridge
+import cv2
 
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
@@ -21,10 +26,13 @@ path_cache = {}
 
 class BaseSyncSaver:
     def __init__(self, config):
+        self.config = config
+
         self.output_pose_path = config.output_pose_path
         self.output_pcd_dir = config.output_pcd_dir
         self.save_on = config.save_on
 
+        self.file_counter = 0
         # Initialize ROS node
         rospy.init_node('rosbag_data_parser', anonymous=True)
 
@@ -32,9 +40,10 @@ class BaseSyncSaver:
         self.sub = rospy.Subscriber(config.input_topic_name, PointCloud2, self.callback, queue_size=100000)
 
         # Publisher for the modified point cloud topic
-        self.pub = rospy.Publisher(config.output_topic_name, PointCloud2, queue_size=1)
-
-        self.pub_transformed = rospy.Publisher("/transformed_cloud", PointCloud2, queue_size=1)
+        self.pub = rospy.Publisher(config.output_topic_name, PointCloud2, queue_size=10)
+        self.pub_transformed = rospy.Publisher("/transformed_cloud", PointCloud2, queue_size=10)
+        self.pub_poses = rospy.Publisher("/poses", Odometry, queue_size=10)
+        self.pub_img = rospy.Publisher('/forward_image', CompressedImage, queue_size=10)
 
     def callback(self, msg):
         # Change the frame_id of the PointCloud2 message
@@ -106,7 +115,9 @@ class KimeraMultiSyncSaver(BaseSyncSaver):
         self.pose_txt_path = config.pose_txt_path
         self.bag_file = config.bag_path
         self.target_robot = config.target_robot
-
+        self.lidar_topic_name = '/' + self.target_robot + '/lidar_points'
+        self.camera_topic_name = '/' + self.target_robot + '/forward/color/image_raw/compressed'
+        print("\033[1;32m", self.lidar_topic_name, "\033[0m")
         self.time_offset = 0.0
 
         # unit: sec
@@ -117,6 +128,8 @@ class KimeraMultiSyncSaver(BaseSyncSaver):
         self.key_rots = R.from_matrix([pose[:3, :3] for pose in self.poses])
 
         self.slerp = Slerp(self.key_times, self.key_rots)
+
+        self.accumulated_clouds = []
 
     def load_pose(self, csv_path):
         data = pd.read_csv(csv_path, delimiter=',')
@@ -186,6 +199,14 @@ class KimeraMultiSyncSaver(BaseSyncSaver):
             transformed = np.array(deskewed_points, dtype=np.float32)
 
             return transformed
+
+    def save_pointcloud(self, points_to_be_saved):
+        pcl_cloud = pcl.PointCloud()
+        pcl_cloud.from_array(points_to_be_saved)
+        filename = f"{self.output_pcd_dir}/{self.file_counter:06d}.pcd"
+        pcl.save(pcl_cloud, filename)
+        rospy.loginfo(f"Saved point cloud to {filename}")
+        self.file_counter += 1
 
     def callback(self, msg):
         # Change the frame_id of the PointCloud2 message
@@ -265,6 +286,23 @@ class KimeraMultiSyncSaver(BaseSyncSaver):
         self.pub.publish(msg)
         self.pub_transformed.publish(msg_transformed)
 
+    def publish_odometry(self, pose, timestamp):
+        odom = Odometry()
+        odom.header.stamp = rospy.Time.from_sec(timestamp)
+        odom.header.frame_id = "map"
+        odom.child_frame_id = "base_link"
+
+        odom.pose.pose.position.x = pose[0, 3]
+        odom.pose.pose.position.y = pose[1, 3]
+        odom.pose.pose.position.z = pose[2, 3]
+
+        q = tf.transformations.quaternion_from_matrix(pose)
+        odom.pose.pose.orientation.x = q[0]
+        odom.pose.pose.orientation.y = q[1]
+        odom.pose.pose.orientation.z = q[2]
+        odom.pose.pose.orientation.w = q[3]
+
+        self.pub_poses.publish(odom)
     def parse_rosbag(self):
         # Open the bag file
         bag = rosbag.Bag(self.bag_file)
@@ -274,9 +312,16 @@ class KimeraMultiSyncSaver(BaseSyncSaver):
         try:
             count = 0
             # Note 't' does not match to the `#timestamp_kf` in the `gt_odom` csv
-            for topic, msg, t in bag.read_messages(topics=['/' + self.target_robot + '/lidar_points']):
+            for topic, msg, t in bag.read_messages(topics=[self.lidar_topic_name]):
                 # Get the current time
                 timestamp = msg.header.stamp.to_sec()
+
+                # if topic == self.camera_topic_name:
+                #     br = CvBridge()
+                #     img = br.compressed_imgmsg_to_cv2(msg)
+                #     cv2.imshow("win", img)
+                #     cv2.waitKey(1)
+                #     continue
 
                 if (timestamp < self.key_times[0]):
                     print(f"Timestamp is too early! Skip visualization...")
@@ -285,11 +330,7 @@ class KimeraMultiSyncSaver(BaseSyncSaver):
                     print(f"Timestamp is out of our boundary! End to save data...")
                     continue
 
-                print("TS of LiDAR msg: ", msg.header.stamp.to_sec(), " <--> TS of bag: ", t.to_sec())
-                count += 1
-                if count < 360:
-                    continue
-
+                # print("TS of LiDAR msg: ", msg.header.stamp.to_sec(), " <--> TS of bag: ", t.to_sec())
                 start_time = time.time()
 
                 # print(f"Current time in bag: {current_time} seconds, {topic}")
@@ -300,13 +341,32 @@ class KimeraMultiSyncSaver(BaseSyncSaver):
                 nsecs_for_each_pt = np.reshape(nsecs_for_each_pt, (-1))
 
                 pose_for_scan_time = self.interpolate_pose(timestamp)
-                deskewed_points = self.deskew_scan(timestamp, cloud_np, nsecs_for_each_pt)
-                transformed = pose_for_scan_time @ np.hstack(
-                    (deskewed_points, np.ones((deskewed_points.shape[0], 1)))).T
+                if self.config.use_deskewing:
+                    deskewed_points = self.deskew_scan(timestamp, cloud_np, nsecs_for_each_pt)
+                    transformed = pose_for_scan_time @ np.hstack(
+                        (deskewed_points, np.ones((deskewed_points.shape[0], 1)))).T
+                else:
+                    print("\033[1;33m", "Deskewing decativated.\033[0m")
+                    transformed = pose_for_scan_time @ np.hstack(
+                        (cloud_np, np.ones((cloud_np.shape[0], 1)))).T
+
                 transformed = transformed.T[:, :3].astype(np.float32)
 
-                # pcl_cloud = pcl.PointCloud()
-                # pcl_cloud.from_array(transformed)
+                pcl_transformed = pcl.PointCloud()
+                pcl_transformed.from_array(transformed)
+                voxel_filter = pcl_transformed.make_voxel_grid_filter()
+                voxel_filter.set_leaf_size(0.1, 0.1, 0.1)
+                downsampled_cloud = voxel_filter.filter()
+                self.accumulated_clouds.append(downsampled_cloud)
+
+                if self.save_on and self.config.use_deskewing:
+                    with open(self.output_pose_path, 'a') as f:
+                        pose_flattened = pose_for_scan_time[:3, :].flatten()
+                        pose_str = ' '.join(map(str, pose_flattened))
+                        f.write(pose_str + '\n')
+                    # Save to PCD file
+                    # Follow the MulRan dataset format
+                    self.save_pointcloud(deskewed_points.astype(np.float32))
 
                 header = msg.header
                 header.frame_id = "map"
@@ -317,6 +377,8 @@ class KimeraMultiSyncSaver(BaseSyncSaver):
                 ]
                 msg_transformed = pc2.create_cloud(header, fields, transformed)
 
+                self.publish_odometry(pose_for_scan_time, timestamp)
+
                 end_time = time.time()
                 elapsed_time = end_time - start_time
 
@@ -324,11 +386,23 @@ class KimeraMultiSyncSaver(BaseSyncSaver):
                 self.pub.publish(msg)
                 self.pub_transformed.publish(msg_transformed)
 
-                if count > 2000:
-                    break
         except KeyboardInterrupt:
             print("Interrupted by user, stopping the loop.")
 
+        combined_cloud = self.accumulated_clouds[0].to_array()
+        for idx, cloud in enumerate(self.accumulated_clouds[1:]):
+            if idx % 1000 == 0:
+                print(idx, " / ", len(self.accumulated_clouds))
+            tmp = cloud.to_array()
+            combined_cloud = np.vstack([combined_cloud, tmp])
+        pcl_combined_cloud = pcl.PointCloud()
+        pcl_combined_cloud.from_array(combined_cloud)
+        voxel_filter = pcl_combined_cloud.make_voxel_grid_filter()
+        voxel_filter.set_leaf_size(0.1, 0.1, 0.1)
+        downsampled_cloud = voxel_filter.filter()
+
+        map_name = f"{self.output_pcd_dir}/map_cloud.pcd"
+        pcl.save(downsampled_cloud, map_name)
         # Close the bag file
         bag.close()
 
@@ -338,6 +412,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_pcd_dir', type=str, help='Output file for the accumulated map.')
 
     parser.add_argument('--save_on', type=bool, default=True, help='Boolean flag to save pcd files.')
+    parser.add_argument('--use_deskewing', type=bool, default=True, help='Boolean flag for setting deskeweing.')
 
     parser.add_argument('--input_topic_name', type=str, default='/os1_cloud_node/points')
     parser.add_argument('--output_topic_name', type=str, default='/os1_cloud_node/points_w_changed_framed_id')
