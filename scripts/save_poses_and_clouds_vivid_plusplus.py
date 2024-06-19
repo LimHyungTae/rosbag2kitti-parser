@@ -330,9 +330,6 @@ if __name__ == '__main__':
         if args.target_dataset == 'vivid++':
             print("Using ViVid++ dataset")
             sub_and_sync_saver = ViVidPlusPlusSubAndSyncSaver(args)
-        elif args.target_dataset == 'kimera-multi':
-            print("Using Kimera-Multi dataset")
-            sub_and_sync_saver = KimeraMultiSubAndSyncSaver(args)
         else:
             sub_and_sync_saver = BaseSubAndSyncSaver(args)
         sub_and_sync_saver.run()

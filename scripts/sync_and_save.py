@@ -7,6 +7,7 @@ from tqdm import tqdm
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
 
+
 def load_data(csv_path, folder_path):
   # Load the data into a DataFrame
   data = pd.read_csv(csv_path, delimiter=',')
@@ -78,12 +79,14 @@ def interpolate_poses(timestamps_of_poses, poses, timestamps_of_scans):
 
   return poses_sync
 
+
 def save_poses(poses_sync, output_file):
   with open(output_file, 'w') as f:
     for pose in poses_sync:
       pose_flattened = pose[:3, :].flatten()
       pose_str = ' '.join(map(str, pose_flattened))
       f.write(pose_str + '\n')
+
 
 def load_and_transform_scans(folder_path, files_in_folder, poses_sync):
   aggregated_points = []
@@ -105,6 +108,7 @@ def load_and_transform_scans(folder_path, files_in_folder, poses_sync):
   map_cloud = np.vstack(aggregated_points)
   return map_cloud
 
+
 def voxelize_and_save(points, voxel_size, output_file):
   pcd = o3d.geometry.PointCloud()
   pcd.points = o3d.utility.Vector3dVector(points[:, :3])
@@ -115,6 +119,7 @@ def voxelize_and_save(points, voxel_size, output_file):
   o3d.io.write_point_cloud(output_file, voxel_down_pcd)
   print("Done!")
 
+
 def main(csv_path, folder_path, output_file, output_pcd_name):
   timestamps_of_poses, poses, timestamps_of_scans, scan_names = load_data(csv_path, folder_path)
   poses_sync = interpolate_poses(timestamps_of_poses, poses, timestamps_of_scans)
@@ -122,7 +127,6 @@ def main(csv_path, folder_path, output_file, output_pcd_name):
 
   map_cloud = load_and_transform_scans(folder_path, scan_names, poses_sync)
   voxelize_and_save(map_cloud, 0.3, output_pcd_name)
-
 
 
 if __name__ == "__main__":
