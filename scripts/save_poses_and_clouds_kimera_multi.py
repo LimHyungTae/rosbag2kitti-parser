@@ -193,7 +193,7 @@ class KimeraMultiSyncSaver(BaseSyncSaver):
             deskewed_points = []
             for idx in range(points_body_frame.shape[0]):
                 pt = points_body_frame[idx, :]
-                pt_time_offset = nsecs_for_each_pt[idx] * 1e-9
+                pt_time_offset = nsecs_for_each_pt[idx]
                 transformed_point = Exp(ang_vel * pt_time_offset) @ np.array([pt[0], pt[1], pt[2]]).T
                 deskewed_points.append(transformed_point.T)
             transformed = np.array(deskewed_points, dtype=np.float32)
@@ -330,12 +330,12 @@ class KimeraMultiSyncSaver(BaseSyncSaver):
                 cloud_points = list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))
                 cloud_np = np.array(cloud_points).reshape(-1, 3)
 
-                nsecs_for_each_pt = np.linspace(0, 0.1, cloud_np.shape[0])
-                nsecs_for_each_pt = np.reshape(nsecs_for_each_pt, (-1))
+                secs_for_each_pt = np.linspace(0, 0.1, cloud_np.shape[0])
+                secs_for_each_pt = np.reshape(secs_for_each_pt, (-1))
 
                 pose_for_scan_time = self.interpolate_pose(timestamp)
                 if self.config.use_deskewing:
-                    deskewed_points = self.deskew_scan(timestamp, cloud_np, nsecs_for_each_pt)
+                    deskewed_points = self.deskew_scan(timestamp, cloud_np, secs_for_each_pt)
                     transformed = pose_for_scan_time @ np.hstack(
                         (deskewed_points, np.ones((deskewed_points.shape[0], 1)))).T
                 else:
@@ -403,6 +403,20 @@ class NewerCollegeSyncSaver(BaseSyncSaver):
     def __init__(self, config):
         super().__init__(config)
         BaseSyncSaver(config)
+
+        # Please refer to `README.md`
+        self.base_wrt_camera = np.array([[0.0, -1.0, 0.0, 0.0],
+                                         [0.0, 0.0, -1.0, 0.0],
+                                         [1.0, 0.0, 0.0, 0.0],
+                                         [0., 0., 0., 1.]])
+        self.lidar_wrt_base = np.array([[-0.70710678, -0.70710678, 0., -0.084],
+                                        [0.70710678, -0.70710678, 0., -0.025],
+                                        [0., 0., 1., 0.05],
+                                        [0., 0., 0., 1.]])
+
+        # T_lc = T_lb * T_bc
+        self.lidar_wrt_camera = self.base_wrt_camera @ self.lidar_wrt_base
+
         self.pose_txt_path = config.pose_txt_path
         self.bag_file = config.bag_path
         self.lidar_topic_name = '/os1_cloud_node/points'
@@ -420,6 +434,8 @@ class NewerCollegeSyncSaver(BaseSyncSaver):
 
         self.accumulated_clouds = []
 
+
+
     def load_pose(self, csv_path):
          data = pd.read_csv(csv_path, delimiter=',')
          # Ensure the 'sec' and 'nsec' columns are treated as integers
@@ -429,6 +445,7 @@ class NewerCollegeSyncSaver(BaseSyncSaver):
          # Extract the timestamps and poses
          timestamps_of_poses = data['sec'] + data['nsec'] * 1e-9
          poses = []
+         init_pose = np.eye(4)
          for i in range(len(data)):
              pose = np.eye(4)
              pose[0, 3] = data['x'][i]
@@ -436,6 +453,11 @@ class NewerCollegeSyncSaver(BaseSyncSaver):
              pose[2, 3] = data['z'][i]
              q = [data['qx'][i], data['qy'][i], data['qz'][i], data['qw'][i]]
              pose[:3, :3] = R.from_quat(q).as_matrix()
+
+             pose = np.linalg.inv(self.lidar_wrt_base) @ pose @ self.lidar_wrt_base
+             if i == 0:
+                 init_pose = pose
+             pose = np.linalg.inv(init_pose) @ pose
              poses.append(pose)
          return timestamps_of_poses, poses
 
@@ -465,14 +487,34 @@ class NewerCollegeSyncSaver(BaseSyncSaver):
 
             return interp_pose
 
-    def deskew_scan(self, timestamp_for_scan, points_body_frame, nsecs_for_each_pt):
-        time_offset = 0.1
+    def get_closest_pose(self, timestamp):
+        idx = np.searchsorted(self.key_times, timestamp)
+
+        if idx == 0:
+            return self.poses[0]
+        elif idx == len(self.key_times):
+            return self.poses[-1]
+        else:
+            prev_time = self.key_times[idx - 1]
+            next_time = self.key_times[idx]
+            if timestamp - prev_time < next_time - timestamp:
+                return self.poses[idx - 1]
+            else:
+                return self.poses[idx]
+
+    def deskew_scan(self, timestamp_for_scan, points_body_frame, nsecs_for_each_pt, verbose=False):
+        secs_for_each_pt = nsecs_for_each_pt * 1e-9
+        if verbose:
+            print("min:", np.amin(secs_for_each_pt), "max: ", np.amax(secs_for_each_pt), "(should be < 0.1)")
+
+        # close to 0.1 sec
+        t_max_interval = np.amax(secs_for_each_pt)
         curr_pose = self.interpolate_pose(timestamp_for_scan)
-        next_pose = self.interpolate_pose(timestamp_for_scan + time_offset)
+        next_pose = self.interpolate_pose(timestamp_for_scan + t_max_interval)
 
         rel_pose = np.linalg.inv(curr_pose) @ next_pose
         rot_vec = Log(rel_pose[:3, :3])
-        ang_vel = rot_vec / time_offset
+        ang_vel = rot_vec / t_max_interval
         # Degree
         ang_norm = np.linalg.norm(rot_vec) * 180.0 / 3.141592
 
@@ -484,7 +526,7 @@ class NewerCollegeSyncSaver(BaseSyncSaver):
             deskewed_points = []
             for idx in range(points_body_frame.shape[0]):
                 pt = points_body_frame[idx, :]
-                pt_time_offset = nsecs_for_each_pt[idx] * 1e-9
+                pt_time_offset = secs_for_each_pt[idx]
                 transformed_point = Exp(ang_vel * pt_time_offset) @ np.array([pt[0], pt[1], pt[2]]).T
                 deskewed_points.append(transformed_point.T)
             transformed = np.array(deskewed_points, dtype=np.float32)
@@ -541,7 +583,7 @@ class NewerCollegeSyncSaver(BaseSyncSaver):
 
         # I omit deskewing for translation
         pose_for_scan_time = self.interpolate_pose(timestamp)
-        deskewed_points = self.deskew_scan(timestamp, cloud_np, nsecs_for_each_pt)
+        deskewed_points = self.deskew_scan(timestamp, cloud_np, nsecs_for_each_pt, True)
         transformed = pose_for_scan_time @ np.hstack((deskewed_points, np.ones((deskewed_points.shape[0], 1)))).T
         transformed = transformed.T[:, :3].astype(np.float32)
 
@@ -621,7 +663,7 @@ class NewerCollegeSyncSaver(BaseSyncSaver):
                 cloud_points = list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))
                 cloud_np = np.array(cloud_points).reshape(-1, 3)
 
-                nsecs_for_each_pt = np.linspace(0, 0.1, cloud_np.shape[0])
+                nsecs_for_each_pt = list(pc2.read_points(msg, field_names=("t"), skip_nans=True))
                 nsecs_for_each_pt = np.reshape(nsecs_for_each_pt, (-1))
 
                 pose_for_scan_time = self.interpolate_pose(timestamp)
@@ -695,8 +737,8 @@ if __name__ == '__main__':
     parser.add_argument('--output_pose_path', type=str, help='Output file for the interpolated poses.')
     parser.add_argument('--output_pcd_dir', type=str, help='Output file for the accumulated map.')
 
-    parser.add_argument('--save_on', type=bool, default=True, help='Boolean flag to save pcd files.')
-    parser.add_argument('--use_deskewing', type=bool, default=False, help='Boolean flag for setting deskeweing.')
+    parser.add_argument('--save_on', type=bool, default=False, help='Boolean flag to save pcd files.')
+    parser.add_argument('--use_deskewing', type=bool, default=True, help='Boolean flag for setting deskeweing.')
 
     parser.add_argument('--input_topic_name', type=str, default='/os1_cloud_node/points')
     parser.add_argument('--output_topic_name', type=str, default='/os1_cloud_node/points_w_changed_framed_id')
@@ -709,6 +751,8 @@ if __name__ == '__main__':
     parser.add_argument('--target_dataset', type=str, default='kimera-multi', choices=['kimera-multi', 'newer-college'],
                         help='Boolean flag to save pcd files.')
     args = parser.parse_args()
+
+    args.save_on = False
 
     try:
         if args.target_dataset == "kimera-multi":

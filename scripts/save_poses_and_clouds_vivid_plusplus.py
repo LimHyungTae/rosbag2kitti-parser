@@ -112,14 +112,17 @@ class ViVidPlusPlusSubAndSyncSaver(BaseSubAndSyncSaver):
             self.time_offset = 1621837331.57603
         else:
             raise ValueError("Un-tested sequence is given.")
+        print("\033[1;32m", self.time_offset, "\033[0m")
         # unit: sec
         self.times = np.loadtxt(self.time_txt_path)
 
         assert len(self.times) == len(self.poses)
         self.key_times = np.array(self.times)
         self.key_rots = R.from_matrix([pose[:3, :3] for pose in self.poses])
-
+        self.prev_pose = None
         self.slerp = Slerp(self.key_times, self.key_rots)
+
+        self.file_counter = 0
 
     def load_campus_pose(self, pose_txt_path):
         poses = []
@@ -229,6 +232,17 @@ class ViVidPlusPlusSubAndSyncSaver(BaseSubAndSyncSaver):
             print(f"Timestamp is out of our boundary! End to save data...")
             return
 
+        # I omit deskewing for translation
+        pose_for_scan_time = self.interpolate_pose(timestamp)
+
+        if self.prev_pose is None:
+            self.prev_pose = pose_for_scan_time
+            return
+        elif np.linalg.norm(self.prev_pose[:3, 3] - pose_for_scan_time[:3, 3]) < 1.0:
+            return
+        else:
+            self.prev_pose = pose_for_scan_time
+
         # Convert PointCloud2 message to PCL PointCloud
         cloud_points = list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))
         cloud_np = np.array(cloud_points).reshape(-1, 3)
@@ -248,8 +262,6 @@ class ViVidPlusPlusSubAndSyncSaver(BaseSubAndSyncSaver):
         #     deskewed_points.append(transformed_point[:3])
         # transformed = np.array(deskewed_points, dtype=np.float32)
 
-        # I omit deskewing for translation
-        pose_for_scan_time = self.interpolate_pose(timestamp)
         deskewed_points = self.deskew_scan(timestamp, cloud_np, nsecs_for_each_pt)
         transformed = pose_for_scan_time @ np.hstack((deskewed_points, np.ones((deskewed_points.shape[0], 1)))).T
         transformed = transformed.T[:, :3].astype(np.float32)
@@ -265,9 +277,11 @@ class ViVidPlusPlusSubAndSyncSaver(BaseSubAndSyncSaver):
                 f.write(pose_str + '\n')
             # Save to PCD file
             # Follow the MulRan dataset format
-            filename = f"{self.output_pcd_dir}/{secs}_{nsecs}.pcd"
+            # filename = f"{self.output_pcd_dir}/{secs}_{nsecs}.pcd"
+            filename = f"{self.output_pcd_dir}/{self.file_counter:06d}.pcd"
             pcl.save(pcl_cloud, filename)
             rospy.loginfo(f"Saved point cloud to {filename}")
+            self.file_counter += 1
 
         # Convert transformed numpy array back to PointCloud2 message
         header = msg.header
